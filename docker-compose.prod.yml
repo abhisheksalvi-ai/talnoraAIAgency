@@ -1,0 +1,147 @@
+# Docker Compose for Development and Production
+
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15
+    container_name: talnora_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-talnora}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-talnora_pass}
+      POSTGRES_DB: ${DB_NAME:-talnora}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/supabase/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-talnora}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - talnora-network
+
+  # Qdrant Vector Database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: talnora_qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      - QDRANT__SERVICE__GRPC_PORT=6334
+    networks:
+      - talnora-network
+
+  # Redis for caching and Celery
+  redis:
+    image: redis:7-alpine
+    container_name: talnora_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - talnora-network
+
+  # Backend API (FastAPI)
+  backend:
+    build:
+      context: .
+      dockerfile: ./apps/api/Dockerfile
+    container_name: talnora_backend
+    restart: unless-stopped
+    env_file:
+      - ./apps/api/.env
+    environment:
+      - DATABASE_URL=postgresql://${DB_USER:-talnora}:${DB_PASSWORD:-talnora_pass}@db:5432/${DB_NAME:-talnora}
+      - QDRANT_URL=http://qdrant:6333
+      - REDIS_URL=redis://redis:6379
+      - ENVIRONMENT=${ENVIRONMENT:-development}
+    volumes:
+      - ./apps/api/app:/app/app
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - talnora-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Frontend (Next.js)
+  frontend:
+    build:
+      context: .
+      dockerfile: ./apps/web/Dockerfile
+    container_name: talnora_frontend
+    restart: unless-stopped
+    env_file:
+      - ./apps/web/.env.local
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      - NODE_ENV=${NODE_ENV:-development}
+    volumes:
+      - ./apps/web/src:/app/src
+      - ./apps/web/public:/app/public
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - talnora-network
+    command: npm run dev
+
+  # Optional: Nginx reverse proxy
+  nginx:
+    image: nginx:alpine
+    container_name: talnora_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - talnora-network
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+
+networks:
+  talnora-network:
+    driver: bridge
